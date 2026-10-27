@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Volver a Android
+Comment=Cierra Linux y vuelve a Android
+Exec=touch /run/native/to-android
+Icon=system-log-out-symbolic
+Categories=System;
+X-Purism-FormFactor=Workstation;Mobile;

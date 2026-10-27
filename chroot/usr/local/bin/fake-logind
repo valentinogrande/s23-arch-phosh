@@ -1,0 +1,294 @@
+#!/usr/bin/python3
+"""Servicios de sistema mínimos para Phosh sin systemd (corre como root en el bus de sistema).
+
+- org.freedesktop.login1: lo que Phosh usa de logind. SetBrightness escribe el backlight;
+  Reboot/PowerOff vuelven a Android (bandera que mira el script native).
+- net.hadess.SensorProxy: iio-sensor-proxy de mentira. La orientación la escribe el puente
+  de Android (DroidBridge) en ORIENT_FILE; Phosh rota la pantalla con eso.
+- Botón de encendido: lo toma en exclusiva (EVIOCGRAB, Android no lo ve) y "apaga" la
+  pantalla con brillo 0 + touch apagado + bloqueo. Nunca DPMS: apagar el panel por
+  msm_drm cuelga el S23.
+"""
+import fcntl
+import os
+import signal
+import struct
+import subprocess
+import sys
+
+import dbus
+import dbus.service
+from dbus.mainloop.glib import DBusGMainLoop
+from gi.repository import GLib
+
+PROPS = "org.freedesktop.DBus.Properties"
+MANAGER = "org.freedesktop.login1.Manager"
+SESSION = "org.freedesktop.login1.Session"
+SENSOR = "net.hadess.SensorProxy"
+SESSION_PATH = "/org/freedesktop/login1/session/auto"
+ORIENT_FILE = "/run/native/orientation"
+TO_ANDROID = "/run/native/to-android"
+SCREEN_OFF = "/run/native/screen-off"   # el script native no re-prende el touch con esto
+BACKLIGHT = "/sys/class/backlight/panel0-backlight/brightness"
+EVIOCGRAB = 0x40044590
+KEY_POWER = 116
+UID = int(sys.argv[1]) if len(sys.argv) > 1 else 7777
+
+
+class PropObject(dbus.service.Object):
+    """Objeto con propiedades de solo lectura en self.props[interfaz]."""
+
+    props = {}
+
+    @dbus.service.method(PROPS, in_signature="ss", out_signature="v")
+    def Get(self, iface, name):
+        return self.props[iface][name]
+
+    @dbus.service.method(PROPS, in_signature="s", out_signature="a{sv}")
+    def GetAll(self, iface):
+        return self.props.get(iface, {})
+
+    @dbus.service.method(PROPS, in_signature="ssv")
+    def Set(self, iface, name, value):
+        raise dbus.exceptions.DBusException("read only", name="org.freedesktop.DBus.Error.PropertyReadOnly")
+
+    @dbus.service.signal(PROPS, signature="sa{sv}as")
+    def PropertiesChanged(self, iface, changed, invalidated):
+        pass
+
+    def update(self, iface, name, value):
+        if self.props[iface].get(name) != value:
+            self.props[iface][name] = value
+            self.PropertiesChanged(iface, {name: value}, [])
+
+
+def to_android(*_):
+    open(TO_ANDROID, "w").close()
+
+
+class Manager(PropObject):
+    def __init__(self, bus):
+        super().__init__(bus, "/org/freedesktop/login1")
+        self.inhibitors = []
+        self.props = {MANAGER: {
+            "IdleHint": False, "BlockInhibited": "", "DelayInhibited": "",
+            "HandlePowerKey": "ignore", "PreparingForSleep": False,
+            "PreparingForShutdown": False, "Docked": False, "LidClosed": False,
+        }}
+
+    @dbus.service.method(MANAGER, in_signature="s", out_signature="o")
+    def GetSession(self, _id):
+        return dbus.ObjectPath(SESSION_PATH)
+
+    @dbus.service.method(MANAGER, in_signature="u", out_signature="o")
+    def GetSessionByPID(self, _pid):
+        return dbus.ObjectPath(SESSION_PATH)
+
+    @dbus.service.method(MANAGER, out_signature="a(susso)")
+    def ListSessions(self):
+        return [("auto", dbus.UInt32(UID), "drtino", "seat0", dbus.ObjectPath(SESSION_PATH))]
+
+    @dbus.service.method(MANAGER, in_signature="ssss", out_signature="h")
+    def Inhibit(self, what, who, why, mode):
+        # El inhibidor dura mientras el cliente tenga abierto su extremo; acá no importa.
+        r, w = os.pipe()
+        self.inhibitors.append(w)
+        return dbus.types.UnixFd(r)
+
+    for _name in ("CanPowerOff", "CanReboot"):
+        exec(f"@dbus.service.method(MANAGER, out_signature='s')\ndef {_name}(self): return 'yes'")
+    for _name in ("CanSuspend", "CanHibernate", "CanHybridSleep", "CanSuspendThenHibernate"):
+        exec(f"@dbus.service.method(MANAGER, out_signature='s')\ndef {_name}(self): return 'na'")
+
+    # Apagar o reiniciar desde Phosh = volver a Android (que reinicia el teléfono).
+    @dbus.service.method(MANAGER, in_signature="b")
+    def PowerOff(self, _interactive):
+        to_android()
+
+    @dbus.service.method(MANAGER, in_signature="b")
+    def Reboot(self, _interactive):
+        to_android()
+
+    @dbus.service.method(MANAGER, in_signature="b")
+    def Suspend(self, _interactive):
+        pass
+
+    @dbus.service.signal(MANAGER, signature="b")
+    def PrepareForSleep(self, start):
+        pass
+
+    @dbus.service.signal(MANAGER, signature="b")
+    def PrepareForShutdown(self, start):
+        pass
+
+
+class Session(PropObject):
+    def __init__(self, bus):
+        super().__init__(bus, SESSION_PATH)
+        self.props = {SESSION: {
+            "Id": "c1", "Name": "drtino", "Active": True, "LockedHint": False,
+            "IdleHint": False, "Type": "wayland", "Class": "user", "State": "active",
+            "Remote": False, "Service": "phosh", "VTNr": dbus.UInt32(1),
+            "Seat": dbus.Struct(("seat0", dbus.ObjectPath("/org/freedesktop/login1/seat/seat0"))),
+            "User": dbus.Struct((dbus.UInt32(UID), dbus.ObjectPath("/org/freedesktop/login1/user/_%d" % UID))),
+        }}
+
+    power = None
+
+    @dbus.service.method(SESSION, in_signature="ssu")
+    def SetBrightness(self, subsystem, name, value):
+        if self.power and self.power.off:
+            self.power.saved = int(value)   # con la pantalla "apagada" se aplica al prender
+            return
+        with open(f"/sys/class/{subsystem}/{name}/brightness", "w") as f:
+            f.write(str(value))
+
+    @dbus.service.method(SESSION, in_signature="b")
+    def SetLockedHint(self, locked):
+        self.update(SESSION, "LockedHint", bool(locked))
+
+    @dbus.service.method(SESSION, in_signature="b")
+    def SetIdleHint(self, idle):
+        self.update(SESSION, "IdleHint", bool(idle))
+
+    @dbus.service.method(SESSION)
+    def Activate(self):
+        pass
+
+    @dbus.service.signal(SESSION)
+    def Lock(self):
+        pass
+
+    @dbus.service.signal(SESSION)
+    def Unlock(self):
+        pass
+
+    # Para el daemon del botón de encendido: `busctl call ... LockSession` → señal Lock a Phosh.
+    @dbus.service.method(SESSION)
+    def LockSession(self):
+        self.Lock()
+
+
+class SensorProxy(PropObject):
+    def __init__(self, bus):
+        super().__init__(bus, "/net/hadess/SensorProxy")
+        self.props = {SENSOR: {
+            "HasAccelerometer": True, "AccelerometerOrientation": "normal",
+            "AccelerometerTilt": "vertical",
+            "HasAmbientLight": False, "LightLevelUnit": "lux", "LightLevel": 0.0,
+            "HasProximity": False, "ProximityNear": False,
+        }}
+        GLib.timeout_add(300, self.poll)
+
+    def poll(self):
+        try:
+            with open(ORIENT_FILE) as f:
+                o = f.read().strip()
+        except OSError:
+            return True
+        if o in ("normal", "left-up", "right-up", "bottom-up"):
+            self.update(SENSOR, "AccelerometerOrientation", o)
+        return True
+
+    for _name in ("ClaimAccelerometer", "ReleaseAccelerometer", "ClaimLight",
+                  "ReleaseLight", "ClaimProximity", "ReleaseProximity"):
+        exec(f"@dbus.service.method(SENSOR)\ndef {_name}(self): pass")
+
+
+def sysfs_input(name):
+    """Directorio /sys/class/input/inputN del dispositivo con ese nombre."""
+    for e in os.listdir("/sys/class/input"):
+        d = f"/sys/class/input/{e}"
+        if e.startswith("input") and open(f"{d}/name").read().strip() == name:
+            return d
+    return None
+
+
+def session_env():
+    """Entorno de la sesión Wayland de drtino (sacado del proceso phosh)."""
+    pid = subprocess.run(["pgrep", "-x", "phosh"], capture_output=True, text=True).stdout.split()
+    env = {"HOME": "/home/drtino", "PATH": "/usr/local/bin:/usr/bin"}
+    if pid:
+        for kv in open(f"/proc/{pid[0]}/environ").read().split("\0"):
+            k, _, v = kv.partition("=")
+            if k in ("DBUS_SESSION_BUS_ADDRESS", "XDG_RUNTIME_DIR", "WAYLAND_DISPLAY"):
+                env[k] = v
+    return env
+
+
+class PowerKey:
+    def __init__(self, session):
+        self.session = session
+        self.blackout = None
+        self.off = False
+        self.saved = 300
+        dev = sysfs_input("pmic_pwrkey")
+        ev = next(e for e in os.listdir(dev) if e.startswith("event"))
+        self.fd = os.open(f"/dev/input/{ev}", os.O_RDONLY | os.O_NONBLOCK)
+        fcntl.ioctl(self.fd, EVIOCGRAB, 1)
+        self.touch = sysfs_input("sec_touchscreen")
+        GLib.io_add_watch(self.fd, GLib.IO_IN, self.on_input)
+
+    def on_input(self, fd, _cond):
+        data = os.read(fd, 24 * 64)
+        for i in range(0, len(data) - 23, 24):
+            _sec, _usec, typ, code, val = struct.unpack("llHHi", data[i:i + 24])
+            if typ == 1 and code == KEY_POWER and val == 1:
+                self.toggle()
+        return True
+
+    def set_touch(self, on):
+        if self.touch:
+            with open(f"{self.touch}/enabled", "w") as f:
+                f.write("1" if on else "0")
+
+    def toggle(self):
+        if not self.off:
+            with open(BACKLIGHT) as f:
+                self.saved = int(f.read()) or 300
+            open(SCREEN_OFF, "w").close()
+            self.off = True
+            self.set_touch(False)
+            with open(BACKLIGHT, "w") as f:
+                f.write("0")
+            self.session.Lock()
+            # El brillo mínimo del panel no es negro: tapar todo con negro, después del
+            # bloqueo para quedar encima. setpriv y no runuser (runuser cuelga el equipo).
+            GLib.timeout_add(800, self.show_blackout)
+        else:
+            if self.blackout:
+                self.blackout.send_signal(signal.SIGTERM)
+                self.blackout = None
+            try:
+                os.unlink(SCREEN_OFF)
+            except FileNotFoundError:
+                pass
+            self.off = False
+            self.set_touch(True)
+            with open(BACKLIGHT, "w") as f:
+                f.write(str(self.saved))
+
+
+    def show_blackout(self):
+        if self.off and not self.blackout:
+            self.blackout = subprocess.Popen(
+                ["setpriv", "--reuid=drtino", "--regid=drtino", "--init-groups",
+                 "/usr/local/bin/blackout"], env=session_env())
+        return False
+
+
+def main():
+    DBusGMainLoop(set_as_default=True)
+    bus = dbus.SystemBus()
+    names = [dbus.service.BusName(n, bus) for n in ("org.freedesktop.login1", SENSOR)]
+    session = Session(bus)
+    objs = [Manager(bus), session, SensorProxy(bus)]
+    try:
+        session.power = PowerKey(session)
+    except Exception as e:
+        print("botón de encendido:", e, file=sys.stderr)
+    GLib.MainLoop().run()
+
+
+if __name__ == "__main__":
+    main()

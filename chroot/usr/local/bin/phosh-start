@@ -1,0 +1,40 @@
+#!/bin/bash
+# Lo lanza phoc (-E): teclado en pantalla + shell.
+# La GPU (KGSL) es solo para phoc: cualquier app que la use cuelga el equipo (watchdog).
+# Mesa de Arch trae kgsl_dri.so (freedreno sobre KGSL): forzar software en OpenGL y
+# dejar a las apps sin Vulkan. cairo arranca más rápido que ngl sobre llvmpipe.
+unset WLR_VK_KGSL WLR_RENDERER
+export LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe GSK_RENDERER=cairo
+export VK_ICD_FILENAMES=/nonexistent.json
+dbus-update-activation-environment LIBGL_ALWAYS_SOFTWARE GALLIUM_DRIVER GSK_RENDERER VK_ICD_FILENAMES
+gsettings set sm.puri.phosh favorites \
+    "['firefox.desktop', 'org.gnome.Console.desktop', 'org.gnome.Nautilus.desktop', 'org.gnome.Calculator.desktop', 'volver-android.desktop']"
+# Sin apagado automático de pantalla: apagar el panel sin el HAL de Samsung no está probado.
+gsettings set org.gnome.desktop.session idle-delay 0
+
+BG=file:///usr/local/share/backgrounds/sequoia.jpg
+for s in org.gnome.desktop.background org.gnome.desktop.screensaver; do
+    gsettings set $s picture-uri "$BG"
+    gsettings set $s picture-uri-dark "$BG"
+    gsettings set $s picture-options zoom
+done
+
+# Teclado (Stevia): latinoamericano + inglés, sugerencias de palabras con hunspell,
+# deslizar entre teclas y emojis.
+gsettings set org.gnome.desktop.input-sources sources "[('xkb', 'latam'), ('xkb', 'us')]"
+gsettings set mobi.phosh.osk completion-mode "['manual', 'hint']"
+gsettings set mobi.phosh.osk osk-features "['key-indicator', 'key-drag']"
+gsettings set mobi.phosh.osk.Completers default 'hunspell'
+gsettings set mobi.phosh.osk.Completers sources "['emoji', 'keyword']" 2>/dev/null
+
+/usr/bin/phosh-osk-stevia &
+
+# Audio: PipeWire con un sink que sale por el audio de Android (FIFO → DroidBridge).
+pipewire & wireplumber & pipewire-pulse &
+(
+    for i in $(seq 50); do pactl info >/dev/null 2>&1 && break; sleep 0.2; done
+    pactl load-module module-pipe-sink file=/run/native/audio.fifo format=s16le rate=48000 \
+        channels=2 sink_name=android sink_properties=device.description=Android
+    pactl set-default-sink android
+) &
+exec /usr/lib/phosh/phosh

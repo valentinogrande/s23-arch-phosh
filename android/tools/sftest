@@ -1,0 +1,55 @@
+#!/system/bin/sh
+# Experimento estilo droid-drm-takeover: frenar SOLO la pantalla de Android
+# (surfaceflinger + composer), dejar vivo system_server (y el Wi-Fi), sin Linux.
+# Uso: sftest [SEGUNDOS]   (default 180). Termina SIEMPRE con un reboot normal.
+#
+# Seguridad (bootloader bloqueado):
+#  - No toca particiones ni usa fastboot; solo `settings`/props (viven en /data).
+#  - zygote es `critical`: si se cae 4 veces en 4 min, init reinicia a bootloader.
+#    Por eso, si cambia el PID de zygote o system_server una sola vez, se aborta.
+#  - persist.sys.disable_rescue evita que RescueParty escale a "factory reset".
+#  - Salida con /system/bin/reboot SIN argumentos (nunca bootloader/recovery/download).
+LOG=/data/local/tmp/sftest.log
+SECS=${1:-180}
+log() { echo "$(cut -d' ' -f1 /proc/uptime) $*" >> $LOG; sync; }
+
+: > $LOG
+# Logcat a disco: después del reboot se pierde el buffer y queremos ver qué tocó el display.
+logcat -c
+logcat -v threadtime -b main,system,events > /data/local/tmp/sftest-logcat.txt 2>&1 &
+zpid() { getprop init.svc_debug_pid.zygote; }
+Z0=$(zpid); S0=$(pidof system_server)
+log "inicio zygote=$Z0 system_server=$S0"
+[ -n "$Z0" ] && [ -n "$S0" ] || { log "Android no está entero, no pruebo"; exit 1; }
+
+setprop persist.sys.disable_rescue true
+settings put global system_server_watchdog_timeout_ms 86400000
+settings put global stay_on_while_plugged_in 7
+setprop ctl.stop system_suspend
+echo sftest > /sys/power/wake_lock
+log "watchdogs desarmados"
+
+setprop ctl.stop surfaceflinger
+setprop ctl.stop vendor.qti.hardware.display.composer
+log "pantalla Android frenada"
+
+i=0; why="ok"
+while [ $i -lt $SECS ]; do
+    sleep 5; i=$((i + 5))
+    if [ "$(zpid)" != "$Z0" ] || [ "$(pidof system_server)" != "$S0" ]; then
+        why="ABORTO: se reinició zygote/system_server"; log "$why"; break
+    fi
+    if ping -c1 -W2 1.1.1.1 >/dev/null 2>&1; then net=si; else net=no; fi
+    log "vivo $i s red=$net"
+done
+
+# Restaurar antes del reboot para que el apagado sea limpio.
+setprop ctl.start vendor.qti.hardware.display.composer
+setprop ctl.start surfaceflinger
+settings delete global system_server_watchdog_timeout_ms
+settings delete global stay_on_while_plugged_in
+setprop ctl.start system_suspend
+echo sftest > /sys/power/wake_unlock
+log "fin ($why), reboot normal"
+sleep 3
+/system/bin/reboot

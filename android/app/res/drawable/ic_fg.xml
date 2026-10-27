@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Triángulo estilo "A" con hueco, sobre el área segura (66dp centrales de 108). -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path
+        android:fillColor="#7AA2F7"
+        android:pathData="M54,28 L78,78 Q66,70 54,68 Q42,70 30,78 Z M54,46 L46,63 Q54,60 62,63 Z" />
+</vector>

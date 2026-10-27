@@ -1,0 +1,8 @@
+#!/bin/bash
+# Reinicia fake-logind dentro de la sesión viva (se mata por PID, no por patrón).
+for p in $(pgrep -x fake-logind; pgrep -f '^/usr/bin/python3 /usr/local/bin/fake-logind'); do kill $p; done
+sleep 1
+setsid nohup /usr/local/bin/fake-logind 7777 > /run/native/fake-logind.log 2>&1 < /dev/null &
+sleep 2
+pgrep -af 'local/bin/fake-logind' | grep -v restart-fl
+cat /run/native/fake-logind.log

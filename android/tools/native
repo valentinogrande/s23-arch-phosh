@@ -1,0 +1,131 @@
+#!/system/bin/sh
+# native: Linux (Phosh) directo en la pantalla. No toca particiones.
+#   native start [SEG]  -> Linux; si SEG, vuelve solo a Android a los SEG segundos
+#   native stop         -> vuelve a Android (reboot normal)
+# Solo se frenan surfaceflinger y el composer: system_server sigue vivo, así que el Wi-Fi
+# de Android sigue conectado y Linux usa su misma red. Nunca tocar wlan0.
+# Requisito (una vez, persiste en /data): setprop persist.vendor.softdog off + reboot.
+# Sin eso el softdog de Samsung tira kernel panic a los 100 s.
+# Desde Linux se vuelve con "Volver a Android", volumen-abajo 3 s, o si phoc se cae.
+T=/data/local/arch-tools
+R=/data/local/arch
+LOG=$T/native.log
+FLAG=$R/run/native/to-android
+LOCK=$T/.switching
+
+log() { echo "$(cut -d' ' -f1 /proc/uptime) $*" >> $LOG; sync; }
+
+# Volver = reboot normal: reiniciar Android en caliente deja el sistema a medias.
+to_android() {
+    mkdir $LOCK 2>/dev/null || return 0   # ya hay otro volviendo
+    log "volviendo a Android ($1)"
+    pkill -f "getevent -l /dev/input" 2>/dev/null
+    pkill -f dev.drtino.bridge.DroidBridge
+    $T/archctl run "pkill -x phosh; pkill -x squeekboard; pkill -x phoc; sleep 1; pkill -9 -x phoc; pkill -x seatd; pkill -x dbus-daemon" >>$LOG 2>&1
+    setprop ctl.start vendor.qti.hardware.display.composer
+    setprop ctl.start surfaceflinger
+    settings delete global system_server_watchdog_timeout_ms
+    setprop ctl.start system_suspend
+    echo native_linux > /sys/power/wake_unlock
+    rm -f $FLAG
+    log "reboot"
+    sync
+    sleep 2
+    /system/bin/reboot
+}
+
+to_linux() {
+    : > $LOG
+    rmdir $LOCK 2>/dev/null
+    # Lanzado desde la app Arch heredamos su cgroup de app: salir al raíz para que
+    # Linux no se congele junto con las apps de Android (ver android_min).
+    echo $$ > /sys/fs/cgroup/cgroup.procs
+    if [ "$(getprop persist.vendor.softdog)" != off ]; then
+        log "softdog activo: setprop persist.vendor.softdog off y reiniciar antes"
+        exit 1
+    fi
+    # Con la pantalla de Android frenada, cualquier llamada de system_server a surfaceflinger
+    # se queda esperando para siempre: sin esto su watchdog lo mata a los ~60 s.
+    settings put global system_server_watchdog_timeout_ms 86400000
+    setprop ctl.stop system_suspend
+    echo native_linux > /sys/power/wake_lock
+    setprop ctl.stop surfaceflinger
+    setprop ctl.stop vendor.qti.hardware.display.composer
+    sleep 1
+    log "Android display frenado"
+    echo 300 > /sys/class/backlight/panel0-backlight/brightness
+    $T/archctl run /usr/local/bin/mobile-session >>$LOG 2>&1 &
+    touch_on &
+    bridge &
+    watch_exit &
+    watch_keys &
+    (sleep 20; android_min) &
+}
+
+# Android al mínimo mientras corre Linux: solo hacen falta system_server y los servicios
+# nativos (Wi-Fi). Congelar todas las apps (cgroup freezer). No usar `am`/`cmd`: con
+# surfaceflinger frenado se quedan esperando a system_server para siempre.
+# Al volver se reinicia, así que no hace falta descongelar.
+android_min() {
+    n=0
+    for d in /sys/fs/cgroup/apps/uid_*; do
+        echo 1 > $d/cgroup.freeze && n=$((n + 1))
+    done
+    log "Android al mínimo: $n uids de apps congelados"
+}
+
+# Samsung apaga el touch cuando su pantalla se va: lo prendemos y lo mantenemos prendido,
+# salvo con la pantalla "apagada" por el botón de encendido (fake-logind).
+touch_on() {
+    TS=$(input_dev sec_touchscreen)
+    while :; do
+        [ -e $R/run/native/screen-off ] || [ "$(cat $TS/enabled)" = 1 ] || {
+            echo 1 > $TS/enabled; log "touch on"; }
+        sleep 1
+    done
+}
+
+# Audio y sensores de Android para Linux (bridge.jar: dev.drtino.bridge.DroidBridge).
+bridge() {
+    sleep 5
+    CLASSPATH=$T/bridge.jar app_process / dev.drtino.bridge.DroidBridge \
+        $R/run/native/audio.fifo $R/run/native/orientation >> $T/bridge.log 2>&1
+}
+
+input_dev() {
+    for e in /sys/class/input/input*; do
+        [ "$(cat $e/name)" = "$1" ] && { echo $e; return; }
+    done
+}
+
+# Botón "Volver a Android" (archivo bandera) o phoc caído.
+watch_exit() {
+    sleep 15
+    while :; do
+        [ -e $FLAG ] && { to_android boton; return; }
+        pgrep -x phoc >/dev/null || { to_android "phoc se cayó"; return; }
+        sleep 0.5
+    done
+}
+
+# Volumen-abajo (pmic_resin) mantenido 3 s.
+watch_keys() {
+    ev=/dev/input/$(basename $(ls -d $(input_dev pmic_resin)/event* | head -1))
+    t=0
+    getevent -l $ev | while read type code val; do
+        case "$code $val" in
+            "KEY_VOLUMEDOWN DOWN") t=$(date +%s) ;;
+            "KEY_VOLUMEDOWN UP")
+                [ $t -gt 0 ] && [ $(( $(date +%s) - t )) -ge 3 ] && { to_android volumen; return; }
+                t=0 ;;
+        esac
+    done
+}
+
+case "$1" in
+    start)
+        to_linux
+        if [ -n "$2" ]; then sleep "$2"; to_android timer; fi ;;
+    stop) to_android manual ;;
+    *) echo "uso: native {start [SEG]|stop}" ;;
+esac

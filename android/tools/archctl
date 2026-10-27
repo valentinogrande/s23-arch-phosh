@@ -1,0 +1,43 @@
+#!/system/bin/sh
+# archctl: monta/desmonta y entra a la chroot de Arch. Solo toca /data/local/arch.
+R=/data/local/arch
+
+is_mounted() { grep -q " $1 " /proc/mounts; }
+
+do_mount() {
+    is_mounted "$R" || { mount --bind "$R" "$R"; mount -o remount,bind,suid,dev,exec "$R"; }
+    is_mounted "$R/proc"    || mount -t proc proc "$R/proc"
+    is_mounted "$R/sys"     || mount -t sysfs sysfs "$R/sys"
+    is_mounted "$R/dev"     || mount --bind /dev "$R/dev"
+    is_mounted "$R/dev/pts" || mount -t devpts devpts "$R/dev/pts" -o gid=5,mode=620,ptmxmode=000
+    mkdir -p "$R/dev/shm"
+    is_mounted "$R/dev/shm" || mount -t tmpfs tmpfs "$R/dev/shm" -o mode=1777
+    is_mounted "$R/tmp"     || mount -t tmpfs tmpfs "$R/tmp" -o mode=1777
+    mkdir -p "$R/run"
+    is_mounted "$R/run"     || mount -t tmpfs tmpfs "$R/run" -o mode=755
+    mkdir -p "$R/sdcard"
+    is_mounted "$R/sdcard"  || mount --bind /sdcard "$R/sdcard"
+    rm -f "$R/etc/resolv.conf"
+    printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' > "$R/etc/resolv.conf"
+}
+
+do_umount() {
+    for m in sdcard run tmp dev/shm dev/pts dev sys proc; do
+        is_mounted "$R/$m" && umount -l "$R/$m"
+    done
+    is_mounted "$R" && umount -l "$R"
+}
+
+enter() {
+    do_mount
+    exec chroot "$R" /usr/bin/env -i HOME=/root TERM=xterm-256color \
+        PATH=/usr/local/sbin:/usr/local/bin:/usr/bin LANG=C.UTF-8 "$@"
+}
+
+case "$1" in
+    mount)  do_mount ;;
+    umount) do_umount ;;
+    run)    shift; enter /bin/bash -lc "$*" ;;
+    shell|"") enter /bin/bash -l ;;
+    *) echo "uso: archctl {mount|umount|shell|run CMD}"; exit 1 ;;
+esac

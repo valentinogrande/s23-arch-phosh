@@ -1,0 +1,28 @@
+#!/system/bin/sh
+# Experimento: frenar SOLO los servicios indicados (sin arrancar Linux) y ver si el equipo
+# se congela a los ~95 s. Uso: stoptest SEGUNDOS servicio1 servicio2 ...
+# Ej: stoptest 180 zygote_secondary zygote
+LOG=/data/local/tmp/stoptest.log
+SECS=$1; shift
+: > $LOG
+echo "servicios: $*" >> $LOG
+echo native_linux > /sys/power/wake_lock
+for s in "$@"; do stop $s; done
+echo "frenado en uptime $(cut -d' ' -f1 /proc/uptime)" >> $LOG
+i=0
+while [ $i -lt $SECS ]; do
+    sleep 5; i=$((i + 5))
+    echo "vivo $i s" >> $LOG
+done
+# Restaurar en el orden de arranque normal; lo que no se frenó ya está corriendo.
+start vendor.qti.hardware.display.composer
+start surfaceflinger
+/system/bin/vdc volume abort_fuse >> $LOG 2>&1
+echo on > /sys/power/state
+for s in audioserver cameraserver media netd wificond perfmond; do
+    stop $s; start $s
+done
+start zygote
+start zygote_secondary
+echo native_linux > /sys/power/wake_unlock
+echo "Android restaurado" >> $LOG

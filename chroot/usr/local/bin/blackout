@@ -1,0 +1,24 @@
+#!/usr/bin/python3
+"""Capa negra a pantalla completa por encima de todo (overlay de layer-shell).
+En OLED negro = píxeles apagados: es la "pantalla apagada" sin DPMS (ver fake-logind)."""
+import gi
+
+gi.require_version("Gtk", "3.0")
+gi.require_version("GtkLayerShell", "0.1")
+from gi.repository import Gtk, Gdk, GtkLayerShell
+
+win = Gtk.Window()
+GtkLayerShell.init_for_window(win)
+GtkLayerShell.set_layer(win, GtkLayerShell.Layer.OVERLAY)
+GtkLayerShell.set_namespace(win, "blackout")
+GtkLayerShell.set_exclusive_zone(win, -1)
+for edge in (GtkLayerShell.Edge.TOP, GtkLayerShell.Edge.BOTTOM,
+             GtkLayerShell.Edge.LEFT, GtkLayerShell.Edge.RIGHT):
+    GtkLayerShell.set_anchor(win, edge, True)
+css = Gtk.CssProvider()
+css.load_from_data(b"window { background-color: #000; }")
+Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), css,
+                                         Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+win.connect("destroy", Gtk.main_quit)
+win.show_all()
+Gtk.main()

@@ -1,0 +1,7 @@
+#!/bin/bash
+# Corre un comando como drtino dentro de la sesión Phosh viva (mismo bus de sesión).
+# setpriv y no runuser: runuser pasa por PAM y, con la sesión nativa corriendo,
+# cuelga el teléfono entero (watchdog de hardware).
+P=$(pgrep -x phosh | head -1)
+A=$(tr '\0' '\n' < /proc/$P/environ | grep -E '^(DBUS_SESSION_BUS_ADDRESS|XDG_RUNTIME_DIR|WAYLAND_DISPLAY)=')
+exec setpriv --reuid=drtino --regid=drtino --init-groups env $A HOME=/home/drtino "$@"

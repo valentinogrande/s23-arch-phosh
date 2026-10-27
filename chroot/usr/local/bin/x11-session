@@ -1,0 +1,34 @@
+#!/bin/bash
+# Sesión Phosh dentro de la ventana de Termux:X11 (DISPLAY=:0). Corre como root en la chroot.
+U=drtino
+UID_=$(id -u $U)
+RT=/run/user/$UID_
+
+mkdir -p /run/dbus "$RT" /run/native
+chmod 1777 /run/native; rm -f /run/native/to-android
+chown $U: "$RT"; chmod 700 "$RT"
+# Puede quedar un socket muerto de una sesión anterior: mirar el proceso, no el archivo.
+if ! pgrep -f "dbus-daemon --system" >/dev/null; then
+    rm -f /run/dbus/system_bus_socket /run/dbus/pid
+    dbus-daemon --system --fork
+fi
+
+# Sin logind: archivos de sesión de sd-login para que NetworkManager acepte el agente de Phosh.
+mkdir -p /run/systemd/users /run/systemd/sessions /run/systemd/seats
+printf 'NAME=%s\nSTATE=active\nRUNTIME=%s\nDISPLAY=c1\nREALTIME=1\nMONOTONIC=1\nSESSIONS=c1\nSEATS=seat0\nACTIVE_SESSIONS=c1\nONLINE_SESSIONS=c1\nACTIVE_SEATS=seat0\nONLINE_SEATS=seat0\n' \
+    $U "$RT" > /run/systemd/users/$UID_
+printf 'UID=%s\nUSER=%s\nACTIVE=1\nIS_DISPLAY=1\nSTATE=active\nREMOTE=0\nTYPE=wayland\nCLASS=user\nSEAT=seat0\nVTNR=1\n' \
+    $UID_ $U > /run/systemd/sessions/c1
+printf 'IS_SEAT0=1\nCAN_MULTI_SESSION=1\nCAN_TTY=0\nCAN_GRAPHICAL=1\nACTIVE=c1\nACTIVE_UID=%s\nSESSIONS=c1\nUIDS=%s\n' \
+    $UID_ $UID_ > /run/systemd/seats/seat0
+
+exec runuser -u $U -- env -i \
+    HOME=/home/$U USER=$U LOGNAME=$U SHELL=/bin/bash LANG=C.UTF-8 \
+    PATH=/usr/local/bin:/usr/bin \
+    XDG_RUNTIME_DIR="$RT" XDG_SESSION_TYPE=wayland XDG_CURRENT_DESKTOP=Phosh:GNOME \
+    GSK_RENDERER=ngl GALLIUM_DRIVER=llvmpipe \
+    dbus-run-session -- \
+    # CPU (pixman): la ruta GPU (Turnip/KGSL sobre buffers de msm_drm + copia a SHM)
+    # terminó en un hard reset del equipo aun con Android corriendo.
+    env DISPLAY=:0 WLR_BACKENDS=x11 WLR_X11_OUTPUTS=1 WLR_RENDERER=pixman \
+    phoc -C /etc/phoc/phoc-x11.ini -E /usr/local/bin/phosh-start

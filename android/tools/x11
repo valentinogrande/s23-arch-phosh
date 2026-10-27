@@ -1,0 +1,56 @@
+#!/system/bin/sh
+# x11: Linux en una ventana de Termux:X11, con Android corriendo. No toca particiones.
+#   x11 start -> arranca X, abre la ventana y la sesión Phosh
+#   x11 stop  -> cierra la sesión y el X
+T=/data/local/arch-tools
+R=/data/local/arch
+LOG=$T/x11.log
+FLAG=$R/run/native/to-android
+
+pref() { # key=valor ...
+    args=""
+    for kv in "$@"; do args="$args --es ${kv%%=*} ${kv#*=}"; done
+    am broadcast -a com.termux.x11.CHANGE_PREFERENCE -p com.termux.x11 $args >>$LOG 2>&1
+}
+
+x_start() {
+    : > $LOG
+    $T/archctl mount
+    pkill -f com.termux.x11.CmdEntryPoint
+    rm -f $R/tmp/.X11-unix/X0 $R/tmp/.X0-lock
+    pref fullscreen=true touchMode=3 showAdditionalKbd=false additionalKbdVisible=false \
+        displayResolutionMode=native hideCutout=true forceOrientation=portrait \
+        screenIdleTimeout=system
+    # El servidor X vive en este proceso (root); la app de Termux:X11 solo muestra la imagen.
+    CLASSPATH=$(pm path com.termux.x11 | cut -d: -f2) TMPDIR=$R/tmp XKB_CONFIG_ROOT=$R/usr/share/xkeyboard-config-2 \
+        setsid app_process / com.termux.x11.CmdEntryPoint :0 >>$LOG 2>&1 &
+    for i in $(seq 100); do [ -S $R/tmp/.X11-unix/X0 ] && break; sleep 0.1; done
+    am start -n com.termux.x11/.MainActivity >>$LOG 2>&1
+    $T/archctl run /usr/local/bin/x11-session >>$LOG 2>&1 &
+    watch_exit &
+}
+
+x_stop() {
+    echo "== cerrando Linux ($1)" >>$LOG
+    $T/archctl run "pkill -x phosh; pkill -x squeekboard; pkill -x phoc; pkill -x dbus-daemon" >>$LOG 2>&1
+    am broadcast -a com.termux.x11.ACTION_STOP -p com.termux.x11 >>$LOG 2>&1
+    pkill -f com.termux.x11.CmdEntryPoint
+    rm -f $FLAG
+    am start -a android.intent.action.MAIN -c android.intent.category.HOME >/dev/null 2>&1
+}
+
+# Botón "Volver a Android" (archivo bandera) o phoc caído.
+watch_exit() {
+    sleep 15
+    while :; do
+        [ -e $FLAG ] && { x_stop boton; return; }
+        pgrep -x phoc >/dev/null || { x_stop "phoc se cayó"; return; }
+        sleep 0.5
+    done
+}
+
+case "$1" in
+    start) x_start ;;
+    stop) x_stop manual ;;
+    *) echo "uso: x11 {start|stop}" ;;
+esac

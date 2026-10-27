@@ -1,0 +1,63 @@
+#!/bin/bash
+# Sesión Phosh nativa sobre card0. Corre como root dentro de la chroot.
+U=drtino
+UID_=$(id -u $U)
+RT=/run/user/$UID_
+
+mkdir -p /run/dbus "$RT" /run/native
+chmod 1777 /run/native; rm -f /run/native/to-android
+chown $U: "$RT"; chmod 700 "$RT"
+# Puede quedar un socket muerto de una sesión anterior: mirar el proceso, no el archivo.
+if ! pgrep -f "dbus-daemon --system" >/dev/null; then
+    rm -f /run/dbus/system_bus_socket /run/dbus/pid
+    dbus-daemon --system --fork
+fi
+
+# Sin udevd: datos udev mínimos para que libinput acepte touch y botones.
+mkdir -p /run/udev/data
+fake_udev() { # $1=eventN $2=propiedades extra
+    local mm; mm=$(cat /sys/class/input/$1/dev)
+    printf 'I:1\nE:ID_INPUT=1\n%bE:ID_SEAT=seat0\nG:seat\nQ:seat\nV:1\n' "$2" > /run/udev/data/c$mm
+}
+for e in /sys/class/input/event*; do
+    n=$(basename $e); name=$(cat $e/device/name)
+    case "$name" in
+        sec_touchscreen) fake_udev $n 'E:ID_INPUT_TOUCHSCREEN=1\n' ;;
+        # pmic_pwrkey no: lo maneja fake-logind en exclusiva (nada de DPMS).
+        gpio-keys|pmic_resin) fake_udev $n 'E:ID_INPUT_KEY=1\n' ;;
+    esac
+done
+
+# Sin logind: archivos de sesión de sd-login (Phosh y stevia buscan su sesión ahí;
+# el resto lo contesta fake-logind por D-Bus).
+mkdir -p /run/systemd/users /run/systemd/sessions /run/systemd/seats
+printf 'NAME=%s\nSTATE=active\nRUNTIME=%s\nDISPLAY=c1\nREALTIME=1\nMONOTONIC=1\nSESSIONS=c1\nSEATS=seat0\nACTIVE_SESSIONS=c1\nONLINE_SESSIONS=c1\nACTIVE_SEATS=seat0\nONLINE_SEATS=seat0\n' \
+    $U "$RT" > /run/systemd/users/$UID_
+printf 'UID=%s\nUSER=%s\nACTIVE=1\nIS_DISPLAY=1\nSTATE=active\nREMOTE=0\nTYPE=wayland\nCLASS=user\nSEAT=seat0\nVTNR=1\n' \
+    $UID_ $U > /run/systemd/sessions/c1
+printf 'IS_SEAT0=1\nCAN_MULTI_SESSION=1\nCAN_TTY=0\nCAN_GRAPHICAL=1\nACTIVE=c1\nACTIVE_UID=%s\nSESSIONS=c1\nUIDS=%s\n' \
+    $UID_ $UID_ > /run/systemd/seats/seat0
+
+
+# logind / iio-sensor-proxy / botón de encendido de mentira (ver fake-logind).
+pkill -f /usr/local/bin/fake-logind
+/usr/local/bin/fake-logind $UID_ > /run/native/fake-logind.log 2>&1 &
+# Audio: PipeWire escribe en este FIFO y DroidBridge (lado Android) lo reproduce.
+rm -f /run/native/audio.fifo; mkfifo -m 666 /run/native/audio.fifo
+
+pkill -x seatd; rm -f /run/seatd.sock
+# Android no tiene VT: seatd sin terminal virtual.
+SEATD_VTBOUND=0 seatd -g video -l error &
+for i in $(seq 20); do [ -S /run/seatd.sock ] && break; sleep 0.1; done
+
+exec runuser -u $U -- env -i \
+    HOME=/home/$U USER=$U LOGNAME=$U SHELL=/bin/bash LANG=C.UTF-8 \
+    PATH=/usr/local/bin:/usr/bin \
+    XDG_RUNTIME_DIR="$RT" XDG_SESSION_TYPE=wayland XDG_CURRENT_DESKTOP=Phosh:GNOME \
+    LIBSEAT_BACKEND=seatd WLR_DRM_DEVICES=/dev/dri/card0 \
+    GSK_RENDERER=cairo LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe \
+    VK_ICD_FILENAMES=/nonexistent.json \
+    dbus-run-session -- \
+    env -u LIBGL_ALWAYS_SOFTWARE PHOC_NO_DPMS=1 WLR_RENDERER=${WLR_RENDERER:-vulkan} WLR_VK_KGSL=1 \
+        VK_ICD_FILENAMES=/opt/mesa-kgsl/share/vulkan/icd.d/freedreno_icd.aarch64.json \
+    phoc -C /etc/phoc/phoc.ini -E /usr/local/bin/phosh-start

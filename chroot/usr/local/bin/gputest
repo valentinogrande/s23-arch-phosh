@@ -1,0 +1,15 @@
+#!/bin/bash
+# Corre un comando como drtino dentro de la sesión Wayland nativa, con el Mesa KGSL.
+# Uso: gputest [MODE] CMD...   MODE: kgsl (default) | cpu
+U=drtino; RT=/run/user/$(id -u $U)
+MODE=kgsl; case "$1" in kgsl|cpu) MODE=$1; shift;; esac
+E=(HOME=/home/$U XDG_RUNTIME_DIR=$RT WAYLAND_DISPLAY=wayland-0 PATH=/usr/local/bin:/usr/bin)
+if [ $MODE = kgsl ]; then
+  E+=(LD_LIBRARY_PATH=/opt/mesa-kgsl/lib
+      __EGL_VENDOR_LIBRARY_FILENAMES=/opt/mesa-kgsl/share/glvnd/egl_vendor.d/50_mesa.json
+      VK_ICD_FILENAMES=/opt/mesa-kgsl/share/vulkan/icd.d/freedreno_icd.aarch64.json
+      MESA_LOADER_DRIVER_OVERRIDE=zink)
+else
+  E+=(GALLIUM_DRIVER=llvmpipe)
+fi
+exec setpriv --reuid=$U --regid=$U --init-groups env "${E[@]}" $GPUTEST_EXTRA "$@"
